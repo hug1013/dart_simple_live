@@ -1,94 +1,208 @@
-name: app-build-action
-#推送Tag时触发
+name: tv-app-build-action
+
+# 推送 tv_* Tag 时触发，或手动触发
 on:
   push:
     tags:
       - "tv_*"
   workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release Tag，例如 tv_1.0.0"
+        required: true
+        type: string
+      source_ref:
+        description: "手动触发时要构建的分支/Tag/SHA，默认 master"
+        required: false
+        default: "master"
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || github.ref_name }}
+  BUILD_REF: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.source_ref || github.ref }}
+  TARGET_COMMITISH: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.source_ref || github.sha }}
+
 jobs:
   build-tv:
     runs-on: macos-latest
     permissions:
       contents: write
-    steps:
-      #签出代码
-      - uses: actions/checkout@v4
-        with:
-          ref: master
 
-      #APK签名设置
-      - name: Download Android keystore
-        id: android_tv_keystore
-        uses: timheuer/base64-to-file@v1.2
+    steps:
+      # 签出代码
+      - name: Checkout code
+        uses: actions/checkout@v4
         with:
-          fileName: keystore.jks
-          encodedString: ${{ secrets.TV_KEYSTORE_BASE64 }}
-      - name: Create key.properties
+          ref: ${{ env.BUILD_REF }}
+          fetch-depth: 0
+
+      # 检查 TV APK 签名 Secrets
+      - name: Check Android TV signing secrets
+        shell: bash
+        env:
+          TV_KEYSTORE_BASE64: ${{ secrets.TV_KEYSTORE_BASE64 }}
+          TV_STORE_PASSWORD: ${{ secrets.TV_STORE_PASSWORD }}
+          TV_KEY_PASSWORD: ${{ secrets.TV_KEY_PASSWORD }}
+          TV_KEY_ALIAS: ${{ secrets.TV_KEY_ALIAS }}
         run: |
-          echo "storeFile=${{ steps.android_tv_keystore.outputs.filePath }}" > simple_live_tv_app/android/key.properties
-          echo "storePassword=${{ secrets.TV_STORE_PASSWORD }}" >> simple_live_tv_app/android/key.properties
-          echo "keyPassword=${{ secrets.TV_KEY_PASSWORD }}" >> simple_live_tv_app/android/key.properties
-          echo "keyAlias=${{ secrets.TV_KEY_ALIAS }}" >> simple_live_tv_app/android/key.properties
+          failed=0
+
+          if [ -z "$TV_KEYSTORE_BASE64" ]; then
+            echo "::error::TV_KEYSTORE_BASE64 is empty. 请在 GitHub Repository secrets 里添加 TV_KEYSTORE_BASE64"
+            failed=1
+          fi
+
+          if [ -z "$TV_STORE_PASSWORD" ]; then
+            echo "::error::TV_STORE_PASSWORD is empty. 请在 GitHub Repository secrets 里添加 TV_STORE_PASSWORD"
+            failed=1
+          fi
+
+          if [ -z "$TV_KEY_PASSWORD" ]; then
+            echo "::error::TV_KEY_PASSWORD is empty. 请在 GitHub Repository secrets 里添加 TV_KEY_PASSWORD"
+            failed=1
+          fi
+
+          if [ -z "$TV_KEY_ALIAS" ]; then
+            echo "::error::TV_KEY_ALIAS is empty. 请在 GitHub Repository secrets 里添加 TV_KEY_ALIAS"
+            failed=1
+          fi
+
+          exit $failed
+
+      # APK签名设置：解码 keystore
+      - name: Decode Android TV keystore
+        id: android_tv_keystore
+        shell: bash
+        env:
+          TV_KEYSTORE_BASE64: ${{ secrets.TV_KEYSTORE_BASE64 }}
+        run: |
+          KEYSTORE_PATH="$RUNNER_TEMP/tv_keystore.jks"
+          export KEYSTORE_PATH
+
+          python3 - <<'PY'
+          import base64
+          import os
+
+          data = os.environ.get("TV_KEYSTORE_BASE64", "")
+          data = "".join(data.split())
+
+          if not data:
+              raise SystemExit("TV_KEYSTORE_BASE64 is empty")
+
+          with open(os.environ["KEYSTORE_PATH"], "wb") as f:
+              f.write(base64.b64decode(data))
+          PY
+
+          echo "filePath=$KEYSTORE_PATH" >> "$GITHUB_OUTPUT"
+
+      - name: Create key.properties
+        shell: bash
+        env:
+          TV_STORE_PASSWORD: ${{ secrets.TV_STORE_PASSWORD }}
+          TV_KEY_PASSWORD: ${{ secrets.TV_KEY_PASSWORD }}
+          TV_KEY_ALIAS: ${{ secrets.TV_KEY_ALIAS }}
+        run: |
+          mkdir -p simple_live_tv_app/android
+
+          {
+            echo "storeFile=${{ steps.android_tv_keystore.outputs.filePath }}"
+            echo "storePassword=$TV_STORE_PASSWORD"
+            echo "keyPassword=$TV_KEY_PASSWORD"
+            echo "keyAlias=$TV_KEY_ALIAS"
+          } > simple_live_tv_app/android/key.properties
 
       # 设置JAVA环境
-      - uses: actions/setup-java@v4
+      - name: Setup Java
+        uses: actions/setup-java@v4
         with:
           distribution: "zulu"
           java-version: "17"
           cache: "gradle"
 
-      #设置Flutter
-      - name: Flutter action
+      # 设置Flutter
+      - name: Setup Flutter
         uses: subosito/flutter-action@v2
         with:
           flutter-version: "3.38.x"
           cache: true
 
-      #更新Flutter的packages
+      # 更新Flutter的packages
       - name: Restore packages
         run: |
           cd simple_live_tv_app
           flutter pub get
 
-      #打包APK
+      # 打包APK
       - name: Build APK
         run: |
           cd simple_live_tv_app
           flutter build apk --release --split-per-abi
 
-      #上传APK至Artifacts
+      # 上传APK至Artifacts
       - name: Upload APK to Artifacts
         uses: actions/upload-artifact@v4
         with:
           name: android_tv
+          if-no-files-found: error
           path: |
             simple_live_tv_app/build/app/outputs/flutter-apk/app-armeabi-v7a-release.apk
             simple_live_tv_app/build/app/outputs/flutter-apk/app-arm64-v8a-release.apk
             simple_live_tv_app/build/app/outputs/flutter-apk/app-x86_64-release.apk
 
-      #读取版本信息
-      - name: Read version
+      # 读取版本信息
+      - name: Read TV version
         id: version
-        uses: juliangruber/read-file-action@v1
-        with:
-          path: assets/tv_app_version.json
-      - name: Echo version
-        run: echo "${{ fromJson(steps.version.outputs.content).version }}"
-      - name: Echo version content
-        run: echo "${{ fromJson(steps.version.outputs.content).version_desc }}"
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
 
-      #上传至Release
+          with open("assets/tv_app_version.json", "r", encoding="utf-8") as f:
+              data = json.load(f)
+
+          version = str(data.get("version", "")).strip()
+          version_desc = str(data.get("version_desc", "")).strip()
+          prerelease = data.get("prerelease", False)
+
+          if not version:
+              version = os.environ.get("RELEASE_TAG", "")
+
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as out:
+              out.write(f"version={version}\n")
+              out.write(f"prerelease={str(bool(prerelease)).lower()}\n")
+
+          with open("release_body.md", "w", encoding="utf-8") as body:
+              body.write("# Android TV\n\n")
+              body.write(version_desc)
+              body.write("\n")
+          PY
+
+      - name: Echo version
+        run: |
+          echo "Release tag: $RELEASE_TAG"
+          echo "Version title: ${{ steps.version.outputs.version }}"
+          echo "Prerelease: ${{ steps.version.outputs.prerelease }}"
+
+      # 上传至Release
       - name: Upload Release
-        uses: softprops/action-gh-release@v1
+        uses: softprops/action-gh-release@v2
         with:
-          name: "${{ fromJson(steps.version.outputs.content).version }}"
-          body: "# Android TV \n${{ fromJson(steps.version.outputs.content).version_desc }}"
-          prerelease: ${{ fromJson(steps.version.outputs.content).prerelease }}
-          token: ${{ secrets.TOKEN }}
+          tag_name: ${{ env.RELEASE_TAG }}
+          target_commitish: ${{ env.TARGET_COMMITISH }}
+          name: "${{ steps.version.outputs.version }}"
+          body_path: release_body.md
+          prerelease: ${{ steps.version.outputs.prerelease }}
+          token: ${{ secrets.TOKEN || github.token }}
           files: |
             simple_live_tv_app/build/app/outputs/flutter-apk/app-x86_64-release.apk
             simple_live_tv_app/build/app/outputs/flutter-apk/app-arm64-v8a-release.apk
             simple_live_tv_app/build/app/outputs/flutter-apk/app-armeabi-v7a-release.apk
 
-      #完成
-      - run: echo "🍏 This job's status is ${{ job.status }}."
+      # 完成
+      - name: Job status
+        if: always()
+        run: echo "🍏 TV job's status is ${{ job.status }}."
